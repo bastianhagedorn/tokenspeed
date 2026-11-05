@@ -499,6 +499,8 @@ HostCacheStats Scheduler::GetHostCacheStats() const {
         .dead_entries_not_written_back = coordinator_.DeadEntriesNotWrittenBack(),
         .demoted_entries_not_written_back = coordinator_.DemotedEntriesNotWrittenBack(),
         .device_evictions = coordinator_.DeviceEvictions(),
+        .lone_compactions = coordinator_.LoneCompactions(),
+        .lone_compaction_moves = coordinator_.LoneCompactionMoves(),
         .checkpoint_resume_gaps = coordinator_.CheckpointResumeGaps(),
     };
 }
