@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -77,30 +78,58 @@ inline std::vector<uint8_t> HexToBytes(const std::string& hex) {
     return bytes;
 }
 
-// extra_keys: per-page list of distinguishing keys (e.g. LoRA name, cache salt);
-// the caller encodes each value, this function owns only the framing.
-//
-// The whole input is prefix-framed -- [prior_len][prior][token_count][tokens]
-// [extra_count][extra...] -- so every section is self-delimiting and no two
-// distinct (prior, tokens, extra_keys) triples can hash the same byte stream:
-// prior_len separates page 0 from a chained page, token_count keeps tokens from
-// bleeding into extra_keys, and per-key length prefixes prevent re-splitting.
-// Feed order is prior_hash -> tokens -> extra_keys.
-inline std::string HashPrefixPage(std::span<const std::int32_t> tokens, const std::string& prior_hash,
-                                  std::span<const std::string> extra_keys = {}) {
+// Absorb token ids as consecutive 4-byte little-endian words on any host: each
+// id's bytes go into a 1 KiB buffer, absorbed whenever it fills and at the end.
+// Sha256UpdateTokensLE uses this on hosts that are not little-endian; it is a
+// separate function so tests run it on little-endian hosts too.
+inline void Sha256UpdateTokensBytewiseLE(SHA256_CTX& ctx, std::span<const std::int32_t> tokens) {
+    uint8_t buf[1024];
+    std::size_t used = 0;
+    for (std::int32_t t : tokens) {
+        const auto v = static_cast<uint32_t>(t);
+        buf[used++] = static_cast<uint8_t>(v);
+        buf[used++] = static_cast<uint8_t>(v >> 8);
+        buf[used++] = static_cast<uint8_t>(v >> 16);
+        buf[used++] = static_cast<uint8_t>(v >> 24);
+        if (used == sizeof(buf)) {
+            SHA256_Update(&ctx, buf, used);
+            used = 0;
+        }
+    }
+    if (used > 0) {
+        SHA256_Update(&ctx, buf, used);
+    }
+}
+
+// Absorb token ids as consecutive 4-byte little-endian words: the bytes of one
+// Sha256UpdateU32LE per id, in as few updates as possible (SHA-256 does not
+// depend on how its input is split). On a little-endian host these are the
+// ids' own bytes, absorbed in a single update.
+inline void Sha256UpdateTokensLE(SHA256_CTX& ctx, std::span<const std::int32_t> tokens) {
+    if constexpr (std::endian::native == std::endian::little) {
+        if (!tokens.empty()) {
+            SHA256_Update(&ctx, tokens.data(), tokens.size_bytes());
+        }
+    } else {
+        Sha256UpdateTokensBytewiseLE(ctx, tokens);
+    }
+}
+
+// HashPrefixPage's digest, with the prior as raw bytes: what HexToBytes makes
+// of the prior hash, so a chain can pass the previous page's digest as is.
+inline void HashPrefixPageDigest(std::span<const std::int32_t> tokens, std::span<const uint8_t> prior_bytes,
+                                 std::span<const std::string> extra_keys,
+                                 unsigned char (&digest)[SHA256_DIGEST_LENGTH]) {
     SHA256_CTX ctx;
     SHA256_Init(&ctx);
 
-    std::vector<uint8_t> prior_bytes = HexToBytes(prior_hash);
     Sha256UpdateU32LE(ctx, static_cast<uint32_t>(prior_bytes.size()));
     if (!prior_bytes.empty()) {
         SHA256_Update(&ctx, prior_bytes.data(), prior_bytes.size());
     }
 
     Sha256UpdateU32LE(ctx, static_cast<uint32_t>(tokens.size()));
-    for (std::int32_t t : tokens) {
-        Sha256UpdateU32LE(ctx, static_cast<uint32_t>(t));
-    }
+    Sha256UpdateTokensLE(ctx, tokens);
 
     // extra_keys is the terminal block, so an empty list can be skipped without
     // ambiguity (a non-empty list always writes a count >= 1 first).
@@ -112,8 +141,23 @@ inline std::string HashPrefixPage(std::span<const std::int32_t> tokens, const st
         }
     }
 
-    unsigned char digest[SHA256_DIGEST_LENGTH];
     SHA256_Final(digest, &ctx);
+}
+
+// extra_keys: per-page list of distinguishing keys (e.g. LoRA name, cache salt);
+// the caller encodes each value, this function owns only the framing.
+//
+// The whole input is prefix-framed -- [prior_len][prior][token_count][tokens]
+// [extra_count][extra...] -- so every section is self-delimiting and no two
+// distinct (prior, tokens, extra_keys) triples can hash the same byte stream:
+// prior_len separates page 0 from a chained page, token_count keeps tokens from
+// bleeding into extra_keys, and per-key length prefixes prevent re-splitting.
+// Feed order is prior_hash -> tokens -> extra_keys.
+inline std::string HashPrefixPage(std::span<const std::int32_t> tokens, const std::string& prior_hash,
+                                  std::span<const std::string> extra_keys = {}) {
+    const std::vector<uint8_t> prior_bytes = HexToBytes(prior_hash);
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    HashPrefixPageDigest(tokens, prior_bytes, extra_keys, digest);
     return DigestToHex(digest);
 }
 
@@ -122,13 +166,19 @@ inline std::vector<std::string> ComputePrefixHashes(
     std::span<const std::span<const std::string>> extra_keys_per_page = {}) {
     std::vector<std::string> hashes;
     hashes.reserve(prefix_pages.size());
-    std::string current_prior = prior;
+    // Each page chains on the previous page's raw digest, which is exactly
+    // what HexToBytes decodes from that page's hash. Two buffers: a page's
+    // digest is written while the previous one is still its prior.
+    const std::vector<uint8_t> first_prior = HexToBytes(prior);
+    std::span<const uint8_t> current_prior = first_prior;
+    unsigned char digests[2][SHA256_DIGEST_LENGTH];
     for (std::size_t i = 0; i < prefix_pages.size(); ++i) {
         std::span<const std::string> extra =
             (i < extra_keys_per_page.size()) ? extra_keys_per_page[i] : std::span<const std::string>{};
-        std::string h = HashPrefixPage(prefix_pages[i], current_prior, extra);
-        hashes.push_back(h);
-        current_prior = h;
+        unsigned char(&digest)[SHA256_DIGEST_LENGTH] = digests[i % 2];
+        HashPrefixPageDigest(prefix_pages[i], current_prior, extra, digest);
+        hashes.push_back(DigestToHex(digest));
+        current_prior = digest;
     }
     return hashes;
 }

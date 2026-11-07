@@ -20,7 +20,9 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -202,6 +204,130 @@ TEST(HashPrefixPageTest, FramingDisambiguatesEmptyPriorFromChainedPage) {
     EXPECT_NE(as_page0, as_chained);
 }
 
+// Append v as 4 little-endian bytes, whatever the host's byte order.
+void AppendU32LE(std::vector<uint8_t>& stream, uint32_t v) {
+    for (int shift = 0; shift < 32; shift += 8) {
+        stream.push_back(static_cast<uint8_t>(v >> shift));
+    }
+}
+
+// The framed stream spelled out byte by byte: every token id is a 4-byte
+// little-endian word whatever the host's byte order, however many updates
+// absorb it.
+std::string FramedStreamSha256(const std::vector<std::int32_t>& tokens, const std::string& prior_hash,
+                               const std::vector<std::string>& extra_keys) {
+    std::vector<uint8_t> stream;
+    const std::vector<uint8_t> prior = HexToBytes(prior_hash);
+    AppendU32LE(stream, static_cast<uint32_t>(prior.size()));
+    stream.insert(stream.end(), prior.begin(), prior.end());
+    AppendU32LE(stream, static_cast<uint32_t>(tokens.size()));
+    for (const std::int32_t t : tokens) {
+        AppendU32LE(stream, static_cast<uint32_t>(t));
+    }
+    if (!extra_keys.empty()) {
+        AppendU32LE(stream, static_cast<uint32_t>(extra_keys.size()));
+        for (const std::string& key : extra_keys) {
+            AppendU32LE(stream, static_cast<uint32_t>(key.size()));
+            stream.insert(stream.end(), key.begin(), key.end());
+        }
+    }
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(stream.data(), stream.size(), digest);
+    return DigestToHex(digest);
+}
+
+TEST(HashPrefixPageTest, TokensAreFramedAsLittleEndianWords) {
+    const std::vector<std::int32_t> edge = {
+        0, 1, -1, std::numeric_limits<std::int32_t>::min(), std::numeric_limits<std::int32_t>::max(), 0x01020304, 256};
+    std::vector<std::int32_t> page(300);
+    for (std::size_t i = 0; i < page.size(); ++i) {
+        page[i] = static_cast<std::int32_t>(i * 2654435761u);
+    }
+    const std::string prior = HashPrefixPage(Tokens(edge), "");
+    for (const std::vector<std::int32_t>* tokens : std::array<const std::vector<std::int32_t>*, 2>{&edge, &page}) {
+        for (const std::string& p : {std::string{}, prior}) {
+            for (const std::vector<std::string>& extra : {std::vector<std::string>{}, {"lora-A", "", "salt"}}) {
+                EXPECT_EQ(HashPrefixPage(Tokens(*tokens), p, Keys(extra)), FramedStreamSha256(*tokens, p, extra))
+                    << tokens->size() << " tokens, prior '" << p << "', " << extra.size() << " extra keys";
+            }
+        }
+    }
+}
+
+// A host that is not little-endian absorbs a page's tokens with the byte-wise
+// encoder, so run it here too: inside a running hash, on the edge ids, and on
+// both sides of each flush of its 1 KiB (256-token) buffer.
+TEST(HashPrefixPageTest, BytewiseTokenEncoderAbsorbsLittleEndianWords) {
+    const std::vector<std::int32_t> edge = {
+        0, 1, -1, std::numeric_limits<std::int32_t>::min(), std::numeric_limits<std::int32_t>::max(), 0x01020304, 256};
+    std::vector<std::int32_t> page(513);
+    for (std::size_t i = 0; i < page.size(); ++i) {
+        page[i] = static_cast<std::int32_t>(i * 2654435761u);
+    }
+    std::vector<token_span> inputs = {Tokens(edge)};
+    for (const std::size_t count : {0u, 1u, 255u, 256u, 257u, 511u, 512u, 513u}) {
+        inputs.emplace_back(page.data(), count);
+    }
+    const std::string before = "prior";
+    const std::string after = "extra";
+    for (const token_span tokens : inputs) {
+        std::vector<uint8_t> stream(before.begin(), before.end());
+        for (const std::int32_t t : tokens) {
+            AppendU32LE(stream, static_cast<uint32_t>(t));
+        }
+        stream.insert(stream.end(), after.begin(), after.end());
+        unsigned char expected[SHA256_DIGEST_LENGTH];
+        SHA256(stream.data(), stream.size(), expected);
+
+        SHA256_CTX ctx;
+        SHA256_Init(&ctx);
+        SHA256_Update(&ctx, before.data(), before.size());
+        Sha256UpdateTokensBytewiseLE(ctx, tokens);
+        SHA256_Update(&ctx, after.data(), after.size());
+        unsigned char got[SHA256_DIGEST_LENGTH];
+        SHA256_Final(got, &ctx);
+        EXPECT_EQ(DigestToHex(got), DigestToHex(expected)) << tokens.size() << " tokens";
+    }
+}
+
+// Digests of the hasher that absorbed one token per update, before tokens
+// went in as one buffer and the chain as raw digests: hashes published by
+// older builds stay valid prefix-cache, KV-event and storage identities.
+TEST(HashPrefixPageTest, KnownDigestsAreUnchanged) {
+    const std::vector<std::int32_t> edge = {
+        0, 1, -1, std::numeric_limits<std::int32_t>::min(), std::numeric_limits<std::int32_t>::max(), 256, 65536, 7};
+    const std::string first = HashPrefixPage(Tokens(edge), "");
+    EXPECT_EQ(first, "78cb08b7e6af3f06585a4ce00ad942759c67e9ee529331ee3d96b55b9c43ee1b");
+    EXPECT_EQ(HashPrefixPage(Tokens(edge), first), "0599cee90211c7aa885f8503aa90c108893a0ec7aa9683922a438dc9f6eef9df");
+    const std::vector<std::string> extra = {"lora-A", "", "salt"};
+    EXPECT_EQ(HashPrefixPage(Tokens(edge), first, Keys(extra)),
+              "f9213804c94467f7701b5eb1487730dc466546571bbdff1e09958e8fc3ac7ea0");
+
+    // Three 256-token pages of negative and positive ids.
+    std::vector<std::int32_t> tokens(3 * 256);
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        tokens[i] = static_cast<std::int32_t>(i) * 7919 - 1000000;
+    }
+    std::vector<token_span> pages;
+    for (std::size_t p = 0; p < 3; ++p) {
+        pages.emplace_back(tokens.data() + 256 * p, 256);
+    }
+    EXPECT_EQ(ComputePrefixHashes(pages, ""),
+              (std::vector<std::string>{"def7ea1a1a9adc0094dcbe942003a2c34513615152ffd203fd4179bdef1ce470",
+                                        "1497b6aa73ab961101b9edb2f8452b8e0db05c7c0f0ba6ea45eb39a3f20ed697",
+                                        "9e76a9c2b23e51a8392c015ee88d4b5d9ca7cb017ebfda234f410a6273f95f56"}));
+    // An uppercase initial prior decodes like its lowercase form.
+    EXPECT_EQ(ComputePrefixHashes(pages, "00112233445566778899AABBCCDDEEFF00112233445566778899AABBCCDDEEFF"),
+              (std::vector<std::string>{"880bfc2f3405663cc27157a067be4bb3665fd7058fd877450956757e3657ef34",
+                                        "59de7812a30536a97c7add7ff98dc6134b0aad0cffe01a4a089583fccfcc0793",
+                                        "4fd45b2c634f417691f2fe9c1802977d61e95e3950030b29dae5e6b772510ee6"}));
+    // Tails of the second page under the first page's hash.
+    EXPECT_EQ(HashPrefixPage(token_span(tokens.data() + 256, 1), ComputePrefixHashes(pages, "")[0]),
+              "57efba6ebc3e56375f9ee2a58181c2f3e0225dcdc283ddd8a5140f729ea8f404");
+    EXPECT_EQ(HashPrefixPage(token_span(tokens.data() + 256, 255), ComputePrefixHashes(pages, "")[0]),
+              "88072b4958ed57ae8df90a9d253a8513ac714b4791439df4e1e6e7faf65506c5");
+}
+
 // A 4-byte extra key must not produce the same stream as count(1) + len(4) +
 // the key's LE int32 folded back into the token list.
 TEST(HashPrefixPageTest, FramingDisambiguatesTokensFromExtraKeys) {
@@ -234,6 +360,32 @@ TEST(ComputePrefixHashesTest, MatchesManualRollingChain) {
     EXPECT_EQ(got[0], h0);
     EXPECT_EQ(got[1], h1);
     EXPECT_EQ(got[2], h2);
+}
+
+// The chain feeds each page the previous page's raw digest; HashPrefixPage
+// decodes the same bytes from that page's hex hash.
+TEST(ComputePrefixHashesTest, RawDigestChainEqualsHexPriorChain) {
+    std::vector<std::int32_t> tokens(7 * 64 + 5);
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+        tokens[i] = static_cast<std::int32_t>(i * 40503u) - 7;
+    }
+    std::vector<token_span> pages;
+    for (std::size_t start = 0; start + 64 <= tokens.size(); start += 64) {
+        pages.emplace_back(tokens.data() + start, 64);
+    }
+    const std::vector<std::string> salt = {"salt"};
+    const std::vector<key_span> extra = {Keys(salt), key_span{}, Keys(salt)};
+    for (const std::string& prior : {std::string{}, HashPrefixPage(Tokens({3}), ""), std::string{"ABCDEF0"}}) {
+        const std::vector<std::string> got = ComputePrefixHashes(pages, prior, extra);
+        ASSERT_EQ(got.size(), pages.size());
+        std::string expected_prior = prior;
+        for (std::size_t i = 0; i < pages.size(); ++i) {
+            const key_span keys = i < extra.size() ? extra[i] : key_span{};
+            const std::string expected = HashPrefixPage(pages[i], expected_prior, keys);
+            EXPECT_EQ(got[i], expected) << "page " << i << " under prior '" << prior << "'";
+            expected_prior = expected;
+        }
+    }
 }
 
 TEST(ComputePrefixHashesTest, SamePageDifferentPrefixDiffers) {
