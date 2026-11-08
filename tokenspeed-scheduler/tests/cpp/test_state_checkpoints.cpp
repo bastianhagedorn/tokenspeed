@@ -54,22 +54,6 @@ class StateCheckpointSuite : public SchedulerTestSuite {
 protected:
     static constexpr std::int32_t kP = 4;
 
-    // These cache probes cancel to reclaim capacity. On P, the abort command
-    // alone cannot release pages: model the peer's retirement ACK and the
-    // outstanding forward result before probing the next request.
-    void AbortAndRetire(const std::string& id) {
-        SendAbortEvent(id);
-        if (config_.role == Role::kP) {
-            ExecutionEvent event;
-            event.With(pd::FailedEvent{id});
-            scheduler_->Advance(std::move(event));
-            if (scheduler_->PdTransferPinned(id)) {
-                SendForwardDone(id);
-            }
-            EXPECT_FALSE(scheduler_->PdTransferPinned(id));
-        }
-    }
-
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
         cfg.prefix_granularity = kP;
@@ -171,7 +155,7 @@ protected:
             }
         }
         AckWriteBacks(plan);
-        AbortAndRetire(id);
+        SendAbortEvent(id);
         PlanOnce();
         return resume;
     }
@@ -333,7 +317,7 @@ TEST_F(AlignedStateCheckpointSuite, AbortDoesNotPublishTheInteriorOutput) {
     Submit(RequestWithTokens("seed", MakeTokens(8192)));
     ASSERT_EQ(PlanAndStateRow("seed").size(), 3u);
     SendForwardDone("seed", {99});
-    AbortAndRetire("seed");
+    SendAbortEvent("seed");
     PlanOnce();
     EXPECT_EQ(scheduler_->EmptyLcmBlocks(), empty);
     EXPECT_EQ(Probe("miss", MakeTokens(8192)).prefix_tokens, 0);
@@ -346,7 +330,7 @@ TEST_F(AlignedStateCheckpointSuite, PrefillResultsDoNotPublishWithoutAFollowingA
     SendForwardDone("seed", {8193});
     // A result advances the request, but publication remains in admission.
     // Abort before the next admission drops the still-private checkpoint.
-    AbortAndRetire("seed");
+    SendAbortEvent("seed");
     PlanOnce();
     EXPECT_EQ(Probe("miss", MakeTokens(8193)).prefix_tokens, 0);
 }
@@ -367,7 +351,7 @@ TEST_F(AlignedStateCheckpointSuite, FirstDecodeAdmissionDeliversThePrecedingPref
         EXPECT_NE(decode_state[1], prefill_state[1]);
         // Stream order permits publication of the previous plan's outputs
         // before its CPU result lands. No checkpoint travels on that result.
-        AbortAndRetire("seed");
+        SendAbortEvent("seed");
         PlanOnce();
         const Resume interior = Probe("interior", MakeTokens(8192));
         EXPECT_EQ(interior.prefix_tokens, 4096);
@@ -470,7 +454,7 @@ TEST_F(AlignedStateCheckpointSuite, RetractedDecodeStateRestoresPrivatelyWithout
     const auto restored_state = PlanAndStateRow("seed");
     ASSERT_GT(restored_state.at(1), 0) << "the request can still resume its private decode state";
     SendForwardDone("seed", {4098});
-    AbortAndRetire("seed");
+    SendAbortEvent("seed");
     EXPECT_EQ(Probe("miss", MakeTokens(4097)).prefix_tokens, 0)
         << "the decode image is not a canonical prefill checkpoint";
 }
@@ -532,7 +516,7 @@ TEST_F(AlignedStateCheckpointSuite, AFinalTailDoesNotAlignTheNextRequestsPackedO
                 EXPECT_EQ(next_batch->input_lengths, std::vector<std::int32_t>{next_length});
                 EXPECT_EQ(next_batch->extend_prefix_lens, std::vector<std::int32_t>{b_fits ? 4096 : 0});
                 EXPECT_EQ(next_batch->input_ids, MakeTokens(next_length, b_fits ? 104096 : 100000));
-                AbortAndRetire("b");
+                SendAbortEvent("b");
                 PlanOnce();
             }
         }
@@ -864,7 +848,7 @@ TEST_F(RetainedCheckpointRetrySuite, DecodeAdmissionDropsAnOptionalCheckpointHol
     ASSERT_NE(probe_batch, nullptr);
     EXPECT_LT(probe_batch->extend_prefix_lens.at(0), 8)
         << "the evicted optional checkpoint is not retained as a reusable input";
-    AbortAndRetire("changed");
+    SendAbortEvent("changed");
     PlanOnce();
 }
 
@@ -2476,7 +2460,7 @@ TEST_F(StateCheckpointSuite, AnAbortWhileFinishingPublishesNothing) {
     SendForwardDone("r", {101});
     PlanOnce();  // decode in flight
     SendFinish("r");
-    AbortAndRetire("r");
+    SendAbortEvent("r");
     EXPECT_EQ(scheduler_->TailEntries(), 1u) << "the prompt end only";
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks());
     EXPECT_EQ(Probe("miss", {1, 2, 3, 4, 5, 6, 101, 77}).prefix_tokens, 6);
@@ -2491,7 +2475,7 @@ TEST_F(StateCheckpointSuite, AbortReleasesBothSlotsAndPublishesNothing) {
     PlanOnce();  // first decode: prompt end published (page + tail + state)
     SendForwardDone("r", {102});
     PlanOnce();  // slot 0 released
-    AbortAndRetire("r");
+    SendAbortEvent("r");
     PlanOnce();
     // Only the published entries stay: page [1 2 3 4], the tail [5 6] in the
     // full group, and the prompt-end state in each state group.
@@ -3552,7 +3536,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AWrittenBackSessionResumesFromHost)
     SendBootstrapped("f1");
     AckWriteBacks(PlanOnce());
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 9);
-    AbortAndRetire("f1");
+    SendAbortEvent("f1");
     AckWriteBacks(PlanOnce());
 
     tokens.push_back(77);
@@ -3595,7 +3579,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, ASharedPromptStaysOnDeviceWhileItsS
         }
     }
     AckWriteBacks(plan);
-    AbortAndRetire("f1");
+    SendAbortEvent("f1");
     AckWriteBacks(PlanOnce());
 
     a.push_back(77);
@@ -3631,7 +3615,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, TailHintSurvivesTheWriteBackWindow)
     EXPECT_EQ(scheduler_->TailEntries(), 1u) << "no tier holds the tail now, but a store is bringing it";
     AckWriteBacks(plan);
     EXPECT_EQ(scheduler_->TailEntries(), 1u);
-    AbortAndRetire("f1");
+    SendAbortEvent("f1");
     AckWriteBacks(PlanOnce());
     tokens.push_back(77);
     EXPECT_EQ(Probe("s1-next", tokens).prefix_tokens, 22);
@@ -3765,7 +3749,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, TheSupersededInputIsTheFirstVictim)
             EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(plan).empty());
         }
         AckWriteBacks(plan);
-        AbortAndRetire("f1");
+        SendAbortEvent("f1");
         AckWriteBacks(PlanOnce());
 
         o.push_back(77);
@@ -3809,7 +3793,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, TheHostDropsACheckpointALaterTurnEx
     EXPECT_EQ(stats.device_evictions.request_reclaim.blocks, 4u);
     EXPECT_EQ(stats.device_evictions.admission.blocks, 0u);
     AckWriteBacks(plan);
-    AbortAndRetire("f1");
+    SendAbortEvent("f1");
     AckWriteBacks(PlanOnce());
 
     o.push_back(77);
@@ -3861,7 +3845,7 @@ TEST_F(StateCheckpointPrefillHostSuite, TheEndStateOutlivesTheInputItSupersedesU
         EXPECT_EQ(evictions.request_reclaim.blocks, 4u);
         EXPECT_EQ(evictions.admission.blocks, 0u);
         AckWriteBacks(plan);
-        AbortAndRetire("f1");
+        SendAbortEvent("f1");
         AckWriteBacks(PlanOnce());
 
         tokens.push_back(77);
@@ -3938,7 +3922,7 @@ TEST_F(StateCheckpointFusedHostSuite, TheFusedRoleMarksTheInputAheadOfBothTailsO
                 }
                 EXPECT_EQ(written_back, policy == SchedulerConfig::HostWritePolicy::kWriteBack ? 4u : 0u);
                 AckWriteBacks(plan);
-                AbortAndRetire("f1");
+                SendAbortEvent("f1");
                 AckWriteBacks(PlanOnce());
 
                 std::vector<std::int32_t> next = h;
@@ -4011,7 +3995,7 @@ TEST_F(StateCheckpointFusedHostSuite, AFinishThatPublishesNoEndStateStillMarksTh
     EXPECT_EQ(evictions.request_reclaim.blocks, 4u) << "the input: its KV block and three checkpoints";
     EXPECT_EQ(evictions.admission.blocks, 0u);
     AckWriteBacks(plan);
-    AbortAndRetire("f1");
+    SendAbortEvent("f1");
     AckWriteBacks(PlanOnce());
 
     std::vector<std::int32_t> next = h;
@@ -4081,7 +4065,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, TheSupersededInputStaysWhenTheNextV
     EXPECT_EQ(evictions.admission.blocks, 9u);
     EXPECT_EQ(evictions.request_reclaim.blocks, 0u);
     AckWriteBacks(plan);
-    AbortAndRetire("f1");
+    SendAbortEvent("f1");
     AckWriteBacks(PlanOnce());
 
     const Resume resent = Probe("resent", tokens);
@@ -4130,7 +4114,7 @@ TEST_F(StateCheckpointPrefillHostSuite, TheSupersededInputOfASingleChunkTurnIsDr
         << "the checkpoint's tail: its KV block and three checkpoints";
     AckWriteBacks(plan);
     EXPECT_EQ(scheduler_->TailEntries(), 1u) << "only h's tail at 27";
-    AbortAndRetire("f1");
+    SendAbortEvent("f1");
     AckWriteBacks(PlanOnce());
 
     tokens.push_back(77);
@@ -4176,7 +4160,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, TheSupersededInputOfATwoChunkTurnIs
         << "the checkpoint's tail: its KV block and three checkpoints";
     EXPECT_EQ(scheduler_->TailEntries(), 1u) << "only h's tail at 38";
     AckWriteBacks(plan);
-    AbortAndRetire("f1");
+    SendAbortEvent("f1");
     AckWriteBacks(PlanOnce());
     std::vector<std::int32_t> other = s1;
     other.push_back(77);
@@ -4247,7 +4231,7 @@ TEST_F(StateCheckpointPrefillHostSuite, AHitUnmarksTheSupersededInputUntilTheHit
             EXPECT_EQ(stats.device_evictions.request_reclaim.blocks, 0u);
         }
         AckWriteBacks(plan);
-        AbortAndRetire("f1");
+        SendAbortEvent("f1");
         AckWriteBacks(PlanOnce());
         const Resume again = Probe("again", tokens);
         EXPECT_EQ(again.prefix_tokens, resend_finishes ? 24 : 22);
@@ -4292,7 +4276,7 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedTransferMarksNothing) {
     EXPECT_EQ(rows_by_group, (std::map<std::uint32_t, std::int32_t>{{0, 6}, {1, 1}, {2, 1}, {3, 1}}));
     EXPECT_EQ(scheduler_->GetHostCacheStats().device_evictions.request_reclaim.blocks, 0u);
     AckWriteBacks(plan);
-    AbortAndRetire("f1");
+    SendAbortEvent("f1");
     AckWriteBacks(PlanOnce());
     const Resume again = Probe("h-again", tokens);
     EXPECT_EQ(again.prefix_tokens, 22);
@@ -4371,7 +4355,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnEarlierFinishLeavesALaterHittersI
                 EXPECT_EQ(rows_by_group, (std::map<std::uint32_t, std::int32_t>{{0, 2}, {1, 1}, {2, 1}, {3, 1}}));
             }
             AckWriteBacks(plan);
-            AbortAndRetire("f1");
+            SendAbortEvent("f1");
             AckWriteBacks(PlanOnce());
             EXPECT_EQ(scheduler_->GetHostCacheStats().host_evictions.lru.blocks, 0u);
             const Resume again = Probe("g-again", g);
@@ -4444,7 +4428,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnOlderPublicationLeavesALaterHitte
         EXPECT_EQ(evictions.admission.blocks, write_back ? 9u : 4u);
         EXPECT_EQ(evictions.request_reclaim.blocks, 0u);
         AckWriteBacks(PlanOnce());
-        AbortAndRetire("f1");
+        SendAbortEvent("f1");
         AckWriteBacks(PlanOnce());
         const Resume again = Probe("g-again", g);
         EXPECT_EQ(again.prefix_tokens, 22);
@@ -4501,7 +4485,7 @@ TEST_F(StateCheckpointPrefillHostSuite, ARestoredInputIsStillMarkedByItsOwnFinis
     AckImageStores(retraction);
     AckWriteBacks(retraction);
     SendForwardDone("f0");
-    AbortAndRetire("f0");
+    SendAbortEvent("f0");
     const ExecutionPlan readmit = PlanOnce();
     ASSERT_NE(FindRestore(readmit), nullptr);
     AckRestores(readmit);
@@ -4526,7 +4510,7 @@ TEST_F(StateCheckpointPrefillHostSuite, ARestoredInputIsStillMarkedByItsOwnFinis
     EXPECT_EQ(after.device_evictions.admission.blocks - before.device_evictions.admission.blocks, 0u);
     EXPECT_EQ(after.device_evictions.request_reclaim.blocks - before.device_evictions.request_reclaim.blocks, 3u);
     AckWriteBacks(plan);
-    AbortAndRetire("f1");
+    SendAbortEvent("f1");
     AckWriteBacks(PlanOnce());
 
     std::vector<std::int32_t> next = h;
@@ -4575,7 +4559,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AJunctionCheckpointOutlivesTheHandO
     EXPECT_EQ(std::ranges::count(store.content_hashes[0], scheduler_->PrefixHashesForTokens(sharing(500)).back()), 1);
     EXPECT_EQ(scheduler_->GetHostCacheStats().device_evictions.request_reclaim.blocks, 0u);
     AckWriteBacks(plan);
-    AbortAndRetire("f1");
+    SendAbortEvent("f1");
     AckWriteBacks(PlanOnce());
     const Resume after = Probe("after-f1", sharing(1300));
     EXPECT_EQ(after.prefix_tokens, 8);
@@ -4596,7 +4580,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, ASegmentHostCannotPlaceIsDroppedWho
     AckWriteBacks(PlanOnce());
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 9);
     ASSERT_EQ(scheduler_->HostPoolFreeBlocks(), 0);
-    AbortAndRetire("f1");
+    SendAbortEvent("f1");
     AckWriteBacks(PlanOnce());
     CompleteSession("s2", MakeTokens(22, 2000));
     ASSERT_EQ(scheduler_->TailEntries(), 2u);
@@ -4635,7 +4619,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, ASessionResumedFromHostIsNotCopiedA
     Submit(RequestWithTokens("f1", MakeTokens(22, 1000)));
     SendBootstrapped("f1");
     AckWriteBacks(PlanOnce());
-    AbortAndRetire("f1");
+    SendAbortEvent("f1");
     AckWriteBacks(PlanOnce());
 
     for (std::int32_t i = 0; i < 4; ++i) {
@@ -4742,11 +4726,8 @@ TEST_P(StateCheckpointPrefillHostShardSuite, PdTransferPinnedPagesAreNeverVictim
     }
     ASSERT_EQ(s1_table["full"].size(), 6u);
     ASSERT_EQ(s2_table["full"].size(), 7u);
-    // s1's prompt-end state is not published until its ACK. s2 recomputes
-    // the prefix and must retain its own transfer pages through publication.
-    for (std::size_t page = 0; page < 5; ++page) {
-        EXPECT_NE(s1_table["full"][page], s2_table["full"][page]);
-    }
+    EXPECT_TRUE(std::equal(s1_table["full"].begin(), s1_table["full"].begin() + 5, s2_table["full"].begin()))
+        << "s2 resumes on s1's five pages";
 
     // By plan: the requests that run, and the rows written back as (group,
     // Device page).
@@ -4931,7 +4912,7 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedAndAnAbortedHandOffFreeTheirPages
     ExecutionEvent failed;
     failed.With(pd::FailedEvent{"a"});
     scheduler_->Advance(std::move(failed));
-    AbortAndRetire("b");
+    SendAbortEvent("b");
     EXPECT_EQ(scheduler_->PdTransferSize(), 0u);
     EXPECT_EQ(scheduler_->EmptyLcmBlocks(), 10) << "each frees its three State parents";
 
@@ -5010,9 +4991,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, WriteBackPlansMatchOnMirroredSchedu
     };
     const std::vector<WriteBackBatch> first = run();
     const std::vector<WriteBackBatch> second = run();
-    // P retains private transfer pages instead of deduplicating the source
-    // tables; this fixture now produces two write-back batches.
-    ASSERT_EQ(first.size(), 2u);
+    ASSERT_EQ(first.size(), 3u);
     ASSERT_EQ(second.size(), first.size());
     for (std::size_t i = 0; i < first.size(); ++i) {
         EXPECT_EQ(second[i].op_ids, first[i].op_ids);
@@ -5237,7 +5216,7 @@ TEST_F(StateCheckpointFusedHostSuite, AClearWaitsForTheEvictionWriteBackInFlight
     const ExecutionPlan eviction = PlanOnce();
     ASSERT_EQ(ExtractCacheOpsOfKind<WriteBackBatch>(eviction).size(), 1u);
     SendForwardDone("f1");
-    AbortAndRetire("f1");
+    SendAbortEvent("f1");
     const ExecutionPlan after_abort = PlanOnce();
     EXPECT_FALSE(scheduler_->CanClearCache());
     EXPECT_FALSE(scheduler_->ClearL1Cache()) << "the eviction write-back is in flight";
@@ -5339,7 +5318,7 @@ TEST_F(StateCheckpointFusedHostSuite, AnInForwardCheckpointNeverEvictsBlockByBlo
     EXPECT_EQ(after.eviction_stores.ops - before.eviction_stores.ops, 1u);
     EXPECT_EQ(after.device_evictions.admission.blocks - before.device_evictions.admission.blocks, 3u)
         << "the checkpoint at 20";
-    AbortAndRetire("big");
+    SendAbortEvent("big");
     AckWriteBacks(PlanOnce());
 
     s0.push_back(77);

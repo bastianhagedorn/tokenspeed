@@ -99,7 +99,7 @@ def _forward(
 
     total = sum(lengths)
     shard = QueryShardPlan.from_forward(
-        total_tokens=total, input_lengths=lengths, size=WORLD, rank=rank, device="cpu"
+        total_tokens=total, input_lengths=lengths, size=WORLD, rank=rank
     )
     gather_ids = torch.cumsum(torch.tensor(lengths), 0) - 1
     vocab = weight.shape[0]
@@ -115,7 +115,7 @@ def _forward(
     )
     out = processor(
         input_ids=None,
-        hidden_states=hidden[shard.local_row_ids].clone(),
+        hidden_states=hidden[shard.local_slice].clone(),
         lm_head=SimpleNamespace(weight=local),
         logits_metadata=metadata,
     )
