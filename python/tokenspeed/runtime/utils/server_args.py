@@ -704,9 +704,6 @@ class ServerArgs:
     enforce_eager: bool = False
     disable_cuda_graph_padding: bool = False
     disable_autotune: bool = False
-    # Opt-in: before it registers with the frontend, the engine serves a few
-    # requests of its own through the ordinary serving path, so the first
-    # client requests compile nothing it reaches.
     enable_startup_requests: bool = False
     enable_cudagraph_gc: bool = False
     disable_nccl_nvls: bool = False
