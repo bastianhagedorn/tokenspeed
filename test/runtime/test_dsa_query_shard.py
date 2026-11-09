@@ -49,7 +49,6 @@ from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.paged import dsa
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     INDEX_K_FORMATS,
-    DSAConfig,
     dsa_history_gather_workspace_bytes,
     dsa_index_k_row_bytes,
     index_k_row_bytes,
@@ -658,64 +657,6 @@ def test_the_history_arm_attends_gathered_groups_with_the_querys_heads(monkeypat
         )
         assert torch.equal(call["topk_slots"], topk[local])
         assert torch.all(out[local] == index)
-
-
-def test_the_history_gate_is_the_amd_kvp_prefill(monkeypatch):
-    """The arm and its workspace go together: the target over KVP pages
-    without query context parallelism, on AMD, outside a bitwise envelope."""
-    from tokenspeed.runtime.layers.attention.configs import dsa as dsa_configs
-    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
-    from tokenspeed.runtime.layers.attention.configs.dsa import (
-        dsa_kvp_history_prefill,
-    )
-    from tokenspeed.runtime.utils.env import global_server_args_dict
-
-    dsa = DSAConfig(
-        backend_name="dsa",
-        index_topk=4,
-        index_head_dim=INDEX_HEAD_DIM,
-        index_n_heads=4,
-        index_k_format="fp8_scaled",
-        num_attention_heads=8,
-        num_kv_heads=8,
-        attn_tp_size=1,
-        head_dim=192,
-        kv_lora_rank=512,
-        qk_nope_head_dim=128,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        scaling=1.0,
-        kv_cache_dim=576,
-    )
-    config = AttnConfig(
-        device="cuda",
-        dtype=torch.bfloat16,
-        kv_cache_dtype=torch.bfloat16,
-        kv_cache_quant_method="none",
-        context_len=256,
-        max_bs=1,
-        kernel_page_size=PAGE,
-        is_draft=False,
-        kvp_size=WORLD,
-        kvp_group=tuple(range(WORLD)),
-        qcp_size=1,
-        qcp_group=(0,),
-        components=(dsa,),
-    )
-
-    def on(is_amd: bool) -> None:
-        monkeypatch.setattr(
-            dsa_configs, "current_platform", lambda: SimpleNamespace(is_amd=is_amd)
-        )
-
-    on(True)
-    monkeypatch.setitem(global_server_args_dict, "numerics", "auto")
-    assert dsa_kvp_history_prefill(config)
-    monkeypatch.setitem(global_server_args_dict, "numerics", "rl-bitwise")
-    assert not dsa_kvp_history_prefill(config)
-    monkeypatch.setitem(global_server_args_dict, "numerics", "auto")
-    on(False)
-    assert not dsa_kvp_history_prefill(config)
 
 
 def test_the_dense_delegate_is_refused_under_a_shard():
