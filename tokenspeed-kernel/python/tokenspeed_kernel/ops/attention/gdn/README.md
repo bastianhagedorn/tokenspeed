@@ -55,3 +55,52 @@ masked during loading. Aligned state accesses are vectorized, with fallbacks
 for unaligned rows and arbitrary row strides. Batch size, window length, and
 payload layer stride remain runtime scalars, so serving shape changes reuse
 the compiled kernel.
+
+### Bounded-grid NVIDIA replay
+
+`gluon_nvidia.launch_gdn_replay_commit_persistent` provides an experimental
+full-head replay with an explicit CTA budget. A work item owns a complete
+128-by-128 value-head state, so V is not split. A persistent grid distributes
+layer, request, and head work across the selected CTAs. The CTA budget bounds
+occupied SMs; it does not reserve particular SMs or GPCs.
+
+Producer warps stage state and token inputs with asynchronous copies while
+compute warps update the accepted prefix in FP32. Full and empty barriers
+count every participating thread. Rejected tokens are masked before loading,
+odd state rows retain a synchronous-copy fallback, and state conversion happens
+only at the final write. Source rows must be independent of other work items'
+destinations; in-place updates within one item remain supported.
+
+The opt-in registry entry `gluon_nvidia_gdn_replay_commit` retains a 24-CTA
+baseline with two state slots, eight compute warps, and a 168-register limit.
+It has lower selection priority than the portable implementation. Select it
+explicitly with
+`TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_GDN_REPLAY_COMMIT=gluon_nvidia_gdn_replay_commit`.
+
+The [bounded replay benchmarks](../../../../../benchmarks/nvidia/gdn_replay_cta16/README.md)
+also save a grouped 16-CTA implementation. For BF16 four-token windows with
+three value heads per key head, it shares key normalization and Gram data
+across those heads and uses an FP32 projection/triangular solve for accepted
+prefixes of three or four tokens. Short prefixes and very small cumulative
+decays use the ordinary recurrence. Other supported layouts use the general
+replay path. The selected implementation uses two state slots, four producer
+warps, and eight compute warps. Batch, layer count, payload stride, and replay
+window length stay runtime arguments.
+
+A separate streamed prototype supports up to three state stages. The
+[graph overlap and SM placement probe](../../../../../benchmarks/nvidia/gdn_commit_overlap/README.md)
+submits the actual captured MTP draft on a second stream and joins it before
+other state commits. These are benchmark adapters; stream overlap requires
+explicit ordering of the target, draft, and commit.
+
+Run the accepted-state, rejected-input, graph-refresh, and compilation-reuse
+checks with:
+
+```bash
+PYTHONPATH=tokenspeed-kernel/python:tokenspeed-kernel/test pytest -q \
+  tokenspeed-kernel/test/nvidia/ops/test_gdn_replay_pipeline.py
+```
+
+The tests retain the repository's dtype tolerances and require untouched state
+rows to remain bitwise unchanged. The benchmark README documents standalone
+CTA sweeps and the distinction between isolated kernel and end-to-end timings.
