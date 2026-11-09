@@ -44,6 +44,7 @@ from tokenspeed_kernel.ops.ple.triton import (
     _ple_conv_state_kernel,
     _ple_gate_norm_kernel,
     _ple_host_gather_kernel,
+    _ple_host_gather_persistent_kernel,
     _ple_page_gather_kernel,
     _ple_page_gather_pair_kernel,
     _ple_page_scatter_kernel,
@@ -71,12 +72,15 @@ def ple_host_gather(
     vocab_end: int,
     scale: float | None,
     row_scale: torch.Tensor | None,
+    *,
+    table_shards: int,
 ) -> torch.Tensor:
     """Gather global n-gram IDs from a sharded table in pinned host memory.
 
     Args:
-        table: Contiguous page-locked CPU table shaped ``[local_vocab, head_dim]``.
-            Its mapped address must be accessible to the GPU.
+        table: Contiguous mapped host table shaped ``[local_vocab, head_dim]``.
+            May be a page-locked CPU tensor or a zero-copy CUDA alias of shared
+            host storage. A CUDA alias does not imply that the bytes occupy HBM.
         ids: Device int64 global row IDs in any shape; flattened for lookup.
         out: Device output with ``ids.numel() * head_dim`` elements, reshapeable
             to ``[ids.numel(), head_dim]``. Rows outside this shard are zeroed.
@@ -87,29 +91,62 @@ def ple_host_gather(
         row_scale: Device tensor with one dequantization factor per local row
             for an online-quantized FP8 table, or ``None`` for scalar scaling
             or compute-dtype storage. At most one scale mode is used.
+        table_shards: Number of table partitions, or one for a complete table.
+            Selects launch geometry for the lookup's host-memory traffic.
 
     Returns:
         The supplied ``out`` tensor, filled with gathered and dequantized rows.
     """
 
+    if table_shards < 1:
+        raise ValueError("table_shards must be positive")
     rows = ids.numel()
     if rows == 0:
         return out
     head_dim = out.shape[-1]
-    _ple_host_gather_kernel[(rows,)](
+    flat_ids = ids.reshape(-1)
+    if table_shards == 1 and rows >= 131072:
+        sms = torch.cuda.get_device_properties(ids.device).multi_processor_count
+        grid = min(_triton.cdiv(rows, 32), sms)
+        flat_ids, destination = torch.sort(flat_ids)
+        _ple_host_gather_persistent_kernel[(grid,)](
+            current_platform().device_visible_data_ptr(table),
+            flat_ids,
+            scale if scale is not None else 1.0,
+            row_scale if row_scale is not None else out,
+            out.view(rows, head_dim),
+            head_dim,
+            vocab_start,
+            vocab_end,
+            rows,
+            grid,
+            destination,
+            IS_FP8=table.dtype == torch.float8_e4m3fn,
+            HAS_SCALE=row_scale is not None or scale is not None,
+            ROW_SCALE=row_scale is not None,
+            BLOCK_D=_triton.next_power_of_2(head_dim),
+            BLOCK_R=32,
+            SORTED=True,
+            num_warps=8,
+        )
+        return out
+    block_rows = 4 if rows >= 256 else 1
+    _ple_host_gather_kernel[(_triton.cdiv(rows, block_rows),)](
         current_platform().device_visible_data_ptr(table),
-        ids.reshape(-1),
+        flat_ids,
         scale if scale is not None else 1.0,
         row_scale if row_scale is not None else out,
         out.view(rows, head_dim),
         head_dim,
         vocab_start,
         vocab_end,
+        rows,
         IS_FP8=table.dtype == torch.float8_e4m3fn,
         HAS_SCALE=row_scale is not None or scale is not None,
         ROW_SCALE=row_scale is not None,
         BLOCK_D=_triton.next_power_of_2(head_dim),
-        num_warps=1,
+        BLOCK_R=block_rows,
+        num_warps=block_rows,
     )
     return out
 
