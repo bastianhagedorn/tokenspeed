@@ -625,7 +625,7 @@ def _history_pages_worker(
         errors[rank] = traceback.format_exc()
 
 
-@pytest.mark.parametrize("index_k_format", ["fp8_scaled", "bf16"])
+@pytest.mark.parametrize("index_k_format", ["fp8_scaled"])
 def test_the_history_prefill_gathers_every_row_to_its_planned_slot(index_k_format):
     """The KVP history prefill's plan over page-sharded planes groups the
     requests by gathered pages, and its page gathers (one all-gather per

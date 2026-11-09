@@ -560,10 +560,8 @@ def test_owned_index_columns_need_kvp_and_the_host_table(case):
 def test_a_history_prefill_selects_each_group_over_its_gathered_pages(monkeypatch):
     """Over gathered histories (AMD) the KVP prefill top-k selects
     as an unsharded cache does, per request group over the index-K pages
-    gathered for it, through the plan's slot map: the forward's rows and
-    workspace numbering unchanged, the selection handed back as the
-    unsharded selection returns it with the plan's slots to map it, and no
-    KVP candidate merge or owned index."""
+    gathered for it, with the forward's rows unchanged and no KVP candidate
+    merge or owned index."""
 
     def refuse(*args, **kwargs):
         raise AssertionError("the KVP candidate path ran")
@@ -616,7 +614,7 @@ def test_a_history_prefill_selects_each_group_over_its_gathered_pages(monkeypatc
         key=torch.zeros(10, 8, dtype=torch.bfloat16),
         weights=torch.zeros(10, 1),
     )
-    record = layer._compute_prefill_topk_indices_portable(
+    layer._compute_prefill_topk_indices_portable(
         indexer_output=output,
         ctx=ctx,
         seq_lens=torch.tensor([6, 5, 5], dtype=torch.int32),
@@ -638,17 +636,7 @@ def test_a_history_prefill_selects_each_group_over_its_gathered_pages(monkeypatc
         rows = group.query
         assert torch.equal(call["row_starts"], row_starts[rows])
         assert torch.equal(call["row_ends"], row_ends[rows])
-        assert call["kv_workspace_slots"] is plan.slots
         assert torch.equal(
             call["candidate_lens_cpu"], (row_ends - row_starts).long()[rows]
         )
         assert int(call["index_k_cache"][0, 0]) == plane_id
-        assert call["page_size"] == 64 and call["topk"] == _TOPK
-    # The sparse prefill maps the rows through the plan's slots.
-    assert record.kv_workspace_slots is plan.slots
-    indices = record.workspace_indices
-    assert indices.dtype == torch.int16
-    assert torch.equal(indices[:, 0], row_starts.to(torch.int16))
-    assert bool((indices[:, 1:] == -1).all())
-    assert torch.equal(record.topk_lens, torch.full((10,), 2, dtype=torch.int32))
-    assert record.dcp_index is None

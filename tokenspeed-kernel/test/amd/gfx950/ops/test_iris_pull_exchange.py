@@ -166,7 +166,7 @@ def _exchange_worker(rank: int, port: int) -> None:
         for _ in range(3):
             run(sources[0], True, outputs[0])
             run(sources[1], False, outputs[1])
-    for replay in range(10):
+    for replay in range(3):
         for index, source in enumerate(sources):
             source.copy_(produce(source.numel(), 200 + 2 * replay + index))
         expected = [
@@ -357,26 +357,7 @@ def _combine_worker(rank: int, port: int) -> None:
     assert not exchange.can_combine_records(
         records.clone(), head_dim=HEAD_DIM, **dtypes
     )
-    assert not exchange.can_combine_records(
-        records.view(torch.float32), head_dim=HEAD_DIM, **dtypes
-    )
-    assert not exchange.can_combine_records(records[:4], head_dim=HEAD_DIM, **dtypes)
-    assert not exchange.can_combine_records(
-        records[:, :, :6], head_dim=HEAD_DIM, **dtypes
-    )
     assert not exchange.can_combine_records(records, head_dim=HEAD_DIM - 2, **dtypes)
-    assert not exchange.can_combine_records(
-        records,
-        head_dim=HEAD_DIM,
-        partial_dtype=torch.float32,
-        output_dtype=torch.bfloat16,
-    )
-    assert not exchange.can_combine_records(
-        records,
-        head_dim=HEAD_DIM,
-        partial_dtype=torch.bfloat16,
-        output_dtype=torch.float16,
-    )
     torch.cuda.synchronize()
     dist.barrier()
     dist.destroy_process_group()

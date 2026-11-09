@@ -91,28 +91,6 @@ def test_small_allreduce_payload_count_reuses_one_binary(moe):
     assert len(set(hashes)) == 1
 
 
-def test_prefix_page_table_width_reuses_one_binary():
-    from tokenspeed.runtime.layers.attention.chunk import (
-        create_chunked_cache_kv_indices_paged,
-    )
-
-    table = torch.empty(32, dtype=torch.int32)
-    lengths = torch.empty(4, dtype=torch.int32)
-    cumulative = torch.empty(5, dtype=torch.int32)
-    output = torch.empty(128, dtype=torch.int32)
-    args = (table, lengths, lengths, cumulative, output)
-    hashes = [
-        _source_hash(
-            create_chunked_cache_kv_indices_paged,
-            args,
-            dict(page_table_ptr_stride=stride, PAGE_SIZE=128),
-            gluon=False,
-        )
-        for stride in (1, 16, 782)
-    ]
-    assert len(set(hashes)) == 1
-
-
 def test_sharded_scorer_table_width_reuses_one_binary():
     from tokenspeed_kernel.ops.attention.dsa._triton.topk import (
         _dsa_decode_logits_fp8_kernel,

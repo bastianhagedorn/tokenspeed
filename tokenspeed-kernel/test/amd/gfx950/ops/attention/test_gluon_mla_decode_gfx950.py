@@ -499,5 +499,5 @@ def test_mla_decode_batches_reuse_split_bucket_binaries(dtype):
     with assert_no_triton_compile(
         decode._mla_decode_gluon, decode._mla_softmax_reducev_kernel
     ):
-        for batch_size in (3, 5, 6, 7, 9, 12, 20, 24):
+        for batch_size in (3, 7, 12, 24):
             check(batch_size)

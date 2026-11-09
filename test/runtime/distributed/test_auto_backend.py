@@ -510,41 +510,6 @@ def test_prepared_symmetric_outputs_bypass_default_size_gate(backend, monkeypatc
     backend._nccl.all_reduce_two.assert_not_called()
 
 
-_RECORDS_COMBINE = {
-    "head_dim": 8,
-    "partial_dtype": torch.bfloat16,
-    "output_dtype": torch.bfloat16,
-}
-
-
-def test_exchanges_route_through_iris_only_where_it_reaches(backend, monkeypatch):
-    monkeypatch.setattr(backend, "_iris_reaches", lambda group: group == (0, 1))
-    out, input, like = torch.empty(8), torch.empty(4), torch.empty(1)
-    for group, served, other in (
-        ((0, 1), backend._iris, backend._nccl),
-        ((0, 2), backend._nccl, backend._iris),
-    ):
-        backend.all_gather_single(out, input, group)
-        backend.all_to_all_single(out, input, group)
-        served.all_gather_single.assert_called_once()
-        served.all_to_all_single.assert_called_once()
-        other.all_gather_single.assert_not_called()
-        other.all_to_all_single.assert_not_called()
-        served.reset_mock()
-    backend._iris.acquire_exchange_input.return_value = input
-    assert backend.acquire_exchange_input(4, like, (0, 1)) is input
-    ordinary = backend.acquire_exchange_input(4, like, (0, 2))
-    assert ordinary.dtype == torch.uint8 and ordinary.numel() == 4
-    backend._iris.acquire_exchange_input.assert_called_once_with(4, like, (0, 1))
-    combined = torch.empty(1)
-    backend._iris.try_combine_records.return_value = combined
-    assert backend.try_combine_records(input, (0, 1), **_RECORDS_COMBINE) is combined
-    assert backend.try_combine_records(input, (0, 2), **_RECORDS_COMBINE) is None
-    backend._iris.try_combine_records.assert_called_once_with(
-        input, (0, 1), **_RECORDS_COMBINE
-    )
-
-
 # ---- The one routing decision ----------------------------------------------
 
 

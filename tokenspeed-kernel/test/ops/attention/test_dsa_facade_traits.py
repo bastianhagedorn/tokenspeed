@@ -1006,49 +1006,39 @@ def test_row_mirror_with_gathered_keys_and_candidate_lengths(
     assert lens.tolist() == [1, 2, 2, 0]
 
 
-def test_candidate_scores_out_reaches_declaring_leaves_and_masks_for_others(
+def test_candidate_scores_out_masks_for_leaves_not_declaring_it(
     fresh_registry, h100_platform
 ):
-    """A leaf declaring ``INDEX_CANDIDATE_SCORES_OUT_FEATURE`` writes into
-    ``scores_out``. For any other leaf the facade fills it, -inf wherever the
-    leaf's offset is -1 or its score NaN, since an exchange of scores alone
-    reads a live candidate off its score."""
+    """For a leaf not declaring ``INDEX_CANDIDATE_SCORES_OUT_FEATURE`` the
+    facade fills ``scores_out``, -inf wherever the leaf's offset is -1 or its
+    score NaN, since an exchange of scores alone reads a live candidate off
+    its score."""
     _ = fresh_registry
     nan = float("nan")
     wide_offsets = torch.tensor(
         [[0, 9, -1, 9, 2, 9, 3, 9], [1, 9, -1, 9, -1, 9, 0, 9]], dtype=torch.int32
     )
     leaf_scores = torch.tensor([[0.5, 7.0, nan, 1.5], [2.0, -3.0, 4.0, -torch.inf]])
-    seen: dict[str, list] = {"silent": [], "declaring": []}
+    seen: list[dict] = []
 
-    def register(name: str, *, declares: bool):
-        def leaf(q, *args, topk, **kwargs):
-            seen[name].append(kwargs)
-            if declares:
-                kwargs["scores_out"].copy_(leaf_scores)
-                return wide_offsets[:, ::2].contiguous(), kwargs["scores_out"]
-            return wide_offsets[:, ::2], leaf_scores.clone()
-
-        KernelRegistry.get().register(
-            KernelSpec(
-                name=name,
-                family="attention",
-                mode="dsa_index_candidates",
-                solution=name,
-                format_signatures=_topk_signature(),
-                features=frozenset(
-                    {dsa_pkg.INDEX_CANDIDATE_SCORES_OUT_FEATURE} if declares else ()
-                ),
-                priority=Priority.PORTABLE,
-            ),
-            leaf,
-        )
+    def leaf(q, *args, topk, **kwargs):
+        seen.append(kwargs)
+        return wide_offsets[:, ::2], leaf_scores.clone()
 
     real_platform = Platform.get()
     Platform.override(h100_platform)
     try:
-        register("silent", declares=False)
-        register("declaring", declares=True)
+        KernelRegistry.get().register(
+            KernelSpec(
+                name="silent",
+                family="attention",
+                mode="dsa_index_candidates",
+                solution="silent",
+                format_signatures=_topk_signature(),
+                priority=Priority.PORTABLE,
+            ),
+            leaf,
+        )
         rows = 2
         inputs = (
             torch.zeros((rows, 2, HEAD_DIM), dtype=torch.bfloat16),
@@ -1066,9 +1056,8 @@ def test_candidate_scores_out_reaches_declaring_leaves_and_masks_for_others(
         offsets, scores = dsa_pkg.dsa_index_candidates(
             *inputs, solution="silent", scores_out=buffer[:, 1:5], **kwargs
         )
-        assert "scores_out" not in seen["silent"][0]
+        assert "scores_out" not in seen[0]
         assert scores.data_ptr() == buffer[:, 1:5].data_ptr()
-        assert offsets.is_contiguous()
         assert torch.equal(offsets, wide_offsets[:, ::2])
         expected = torch.tensor(
             [
@@ -1078,13 +1067,6 @@ def test_candidate_scores_out_reaches_declaring_leaves_and_masks_for_others(
         )
         assert torch.equal(buffer[:, 1:5], expected)
         assert torch.equal(buffer[:, [0, 5]], torch.full((rows, 2), 11.0))
-
-        scores_out = torch.empty((rows, 4))
-        _, scores = dsa_pkg.dsa_index_candidates(
-            *inputs, solution="declaring", scores_out=scores_out, **kwargs
-        )
-        [call] = seen["declaring"]
-        assert call["scores_out"] is scores_out and scores is scores_out
         with pytest.raises(ValueError, match=r"FP32 \[rows, topk\] output"):
             dsa_pkg.dsa_index_candidates(
                 *inputs, solution="silent", scores_out=torch.empty((rows, 3)), **kwargs

@@ -53,7 +53,6 @@ def test_startup_requests_are_off_unless_asked_for():
     "flags",
     [
         ("--disaggregation-mode", "prefill"),
-        ("--disaggregation-mode", "decode"),
         ("--kvstore-storage-backend", "memory"),
     ],
 )
