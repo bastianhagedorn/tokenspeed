@@ -982,8 +982,8 @@ one-token request, one of a whole prefill chunk, then `max_num_seqs`
 requests whose prompts cross one chunk boundary, each cut to what ingress
 admits and so the whole batch fits the cache. Each phase runs until every
 rank is idle, then its prefixes are flushed, so serving starts from an
-empty cache. Their outputs go nowhere, kernels prepare their compile
-variants as in model warmup, and the random seed is reset afterwards. Only
+empty cache. Their outputs go nowhere and kernels prepare their compile
+variants as in model warmup. Only
 then does the host complete the frontend handshake and report ready: no
 client request waits behind them or is timed with them.
 

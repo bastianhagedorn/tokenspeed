@@ -147,7 +147,6 @@ from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 from tokenspeed.runtime.utils import (
     configure_logger,
     get_colorful_logger,
-    set_random_seed,
 )
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
@@ -1620,9 +1619,6 @@ class HostBootstrap:
         """End startup: from here on a host synchronization or a kernel
         compilation on the data plane is a stall."""
         self.data_plane.finish_startup()
-        # The startup requests drew from the generator: serving starts from
-        # the state model startup left (``build_device_side``).
-        set_random_seed(48)
         arm_data_plane_sync_debug(self._server_args.device)
         mark_jit_compile_serving()
         freeze_startup_heap()
