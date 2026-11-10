@@ -64,9 +64,12 @@ impl Limits {
     }
 
     /// The startup phases, each a shape serving reaches: a one-token
-    /// request, a request of a whole prefill chunk, then a full batch whose
-    /// prompts cross one chunk boundary, so its prefill rounds also mix a
-    /// finishing request with a starting one before every request decodes.
+    /// request; requests of a thirty-second of a prefill chunk, a sixteenth,
+    /// one token more, and three sixteenths (the partial forwards that short
+    /// prompts and the last chunk of a long one run, aligned and not); a
+    /// request of a whole chunk; then a full batch whose prompts cross one
+    /// chunk boundary, so its prefill rounds also mix a finishing request
+    /// with a starting one before every request decodes.
     /// Prompts are cut to what ingress admits and so the whole batch, with
     /// its output and the pages both round up to, fits the cache at once;
     /// a phase that cannot fit is left out.
@@ -78,8 +81,12 @@ impl Limits {
         let fits = |batch: usize| {
             (self.token_capacity / batch.max(1)).saturating_sub(output + 2 * self.page_tokens)
         };
-        [
+        let mut phases: Vec<Phase> = [
             (1, 1),
+            (1, self.chunk_tokens / 32),
+            (1, self.chunk_tokens / 16),
+            (1, self.chunk_tokens / 16 + 1),
+            (1, self.chunk_tokens * 3 / 16),
             (1, self.chunk_tokens),
             (self.max_batch_size, self.chunk_tokens + 1),
         ]
@@ -89,7 +96,9 @@ impl Limits {
             prompt_len: prompt_len.min(longest).min(fits(batch)),
         })
         .filter(|phase| phase.batch > 0 && phase.prompt_len > 0)
-        .collect()
+        .collect();
+        phases.dedup();
+        phases
     }
 }
 
@@ -153,7 +162,15 @@ mod tests {
     fn a_roomy_cache_runs_every_shape_at_its_limit() {
         assert_eq!(
             limits(897_024).phases(),
-            [phase(1, 1), phase(1, 8192), phase(48, 8193)]
+            [
+                phase(1, 1),
+                phase(1, 256),
+                phase(1, 512),
+                phase(1, 513),
+                phase(1, 1536),
+                phase(1, 8192),
+                phase(48, 8193)
+            ]
         );
     }
 
@@ -161,8 +178,27 @@ mod tests {
     fn the_full_batch_is_cut_to_what_the_cache_holds_at_once() {
         // 302592 / 48 = 6304 tokens per request, less 17 of output and two
         // pages.
-        assert_eq!(limits(302_592).phases()[2], phase(48, 6031));
-        assert_eq!(limits(48 * 200).phases(), [phase(1, 1), phase(1, 8192)]);
+        assert_eq!(limits(302_592).phases()[6], phase(48, 6031));
+        assert_eq!(
+            limits(48 * 200).phases(),
+            [
+                phase(1, 1),
+                phase(1, 256),
+                phase(1, 512),
+                phase(1, 513),
+                phase(1, 1536),
+                phase(1, 8192)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tiny_chunk_runs_each_shape_once() {
+        let limits = Limits {
+            chunk_tokens: 4,
+            ..limits(1 << 30)
+        };
+        assert_eq!(limits.phases(), [phase(1, 1), phase(1, 4), phase(48, 5)]);
     }
 
     #[test]
@@ -174,7 +210,15 @@ mod tests {
         };
         assert_eq!(
             limits.phases(),
-            [phase(1, 1), phase(1, 3993), phase(48, 3993)]
+            [
+                phase(1, 1),
+                phase(1, 256),
+                phase(1, 512),
+                phase(1, 513),
+                phase(1, 1536),
+                phase(1, 3993),
+                phase(48, 3993)
+            ]
         );
     }
 }

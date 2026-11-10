@@ -978,8 +978,11 @@ its own through the ordinary rounds (admission, planning, the data plane,
 commits), on every rank of the replica as a frontend's would be.
 
 `startup::Limits::phases` sizes them from the engine's limits alone: one
-one-token request, one of a whole prefill chunk, then `max_num_seqs`
-requests whose prompts cross one chunk boundary, each cut to what ingress
+one-token request, one each of a thirty-second of a prefill chunk, a
+sixteenth, one token more, and three sixteenths (the partial forwards that
+short prompts and a long prompt's last chunk run, aligned and not), one of a
+whole chunk, then `max_num_seqs` requests whose prompts cross one chunk
+boundary, each cut to what ingress
 admits and so the whole batch fits the cache. Each phase runs until every
 rank is idle, then its prefixes are flushed, so serving starts from an
 empty cache. Their outputs go nowhere and kernels prepare their compile
